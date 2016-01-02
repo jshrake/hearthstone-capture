@@ -1,10 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"flag"
+	"fmt"
 	"io"
-	"log"
 	"sync"
 	"time"
 
@@ -13,9 +14,6 @@ import (
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/tcpassembly"
 	"github.com/google/gopacket/tcpassembly/tcpreader"
-
-	"database/sql"
-	_ "github.com/mattn/go-sqlite3"
 )
 
 // courtesy of https://blog.golang.org/pipelines
@@ -70,127 +68,74 @@ func capturePackets(devices []pcap.Interface, snapLen int, filter string) <-chan
 	return merge(listeners...)
 }
 
-type PegasusPacket struct {
-	Type    uint32
-	Size    uint32
-	Payload []byte
-}
-
 type PegasusPacketStreamFactory struct {
-	Out chan PegasusPacket
 }
 
 func (streamFactory *PegasusPacketStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
 	r := tcpreader.NewReaderStream()
-	go handlePegasusPackets(&r, streamFactory.Out)
+	go func(reader io.Reader) {
+		// NOTE(jshrake): rate limit the amount of packets streamed to stdout so we don't spin several
+		// cores on the users machine. 60 packets per second is sufficient
+		ticker := time.Tick(16 * time.Millisecond)
+		packedBuffer := new(bytes.Buffer)
+		for {
+			select {
+			case <-ticker:
+				// First 4 bytes are the payload type
+				var packetType uint32
+				if err := binary.Read(reader, binary.LittleEndian, &packetType); err != nil {
+					tcpreader.DiscardBytesToEOF(reader)
+					continue
+				}
+				// Discard packets with unknown types
+				if packetType > 500 {
+					tcpreader.DiscardBytesToEOF(reader)
+					continue
+				}
+				// Next 4 bytes are the payload size
+				var packetSize uint32
+				if err := binary.Read(reader, binary.LittleEndian, &packetSize); err != nil {
+					tcpreader.DiscardBytesToEOF(reader)
+					continue
+				}
+				// Discard ridiculously sized packets
+				if packetSize > 9000 {
+					tcpreader.DiscardBytesToEOF(reader)
+					continue
+				}
+				// Read the payload
+				payload := make([]byte, packetSize)
+				if err := binary.Read(reader, binary.LittleEndian, &payload); err != nil {
+					tcpreader.DiscardBytesToEOF(reader)
+					continue
+				}
+				// Pack the data back into the packedBuffer and write to stdout
+				binary.Write(packedBuffer, binary.LittleEndian, packetType)
+				binary.Write(packedBuffer, binary.LittleEndian, packetSize)
+				binary.Write(packedBuffer, binary.LittleEndian, payload)
+				fmt.Println(packedBuffer)
+				packedBuffer.Reset()
+			}
+		}
+	}(&r)
 	return &r
 }
 
-func handlePegasusPackets(r io.Reader, out chan<- PegasusPacket) {
-	ticker := time.Tick(time.Millisecond)
-	for {
-		select {
-		case <-ticker:
-			// First 4 bytes are the payload type
-			var payloadType uint32
-			if err := binary.Read(r, binary.LittleEndian, &payloadType); err != nil {
-				tcpreader.DiscardBytesToEOF(r)
-				continue
-			}
-			// Ignore ping (115), pong (116), and messages outside of the PegasusPacket type range
-			if payloadType > 500 || payloadType == 115 || payloadType == 116 {
-				tcpreader.DiscardBytesToEOF(r)
-				continue
-			}
-			// Next 4 bytes are the payload size
-			var payloadSize uint32
-			if err := binary.Read(r, binary.LittleEndian, &payloadSize); err != nil {
-				tcpreader.DiscardBytesToEOF(r)
-				continue
-			}
-			// Read the payload
-			payload := make([]byte, payloadSize)
-			if err := binary.Read(r, binary.LittleEndian, &payload); err != nil {
-				tcpreader.DiscardBytesToEOF(r)
-				continue
-			}
-			out <- PegasusPacket{
-				Type:    payloadType,
-				Size:    payloadSize,
-				Payload: payload,
-			}
-		}
-	}
-}
-
-const PegasusPacketFilter string = "(tcp port 3724 or tcp port 1119) and not host (12.130.244.193 or 12.129.242.24 or 12.129.206.133)"
-
-var snaplen = flag.Int("snaplen", 1600, "Snaplen for pcap packet capture")
-var filter = flag.String("filter", PegasusPacketFilter, "BPF filter for pcap")
-var dbPath = flag.String("db", "./hearthstone.db", "Path to the database")
+var snaplen = flag.Int("snaplen", 1600, "Snaplen for pcap")
+var filter = flag.String("filter", "tcp port 3724 or tcp port 1119", "BPF filter for pcap")
 
 func main() {
 	flag.Parse()
-	// Open the database
-	db, openDbErr := sql.Open("sqlite3", *dbPath)
-	if openDbErr != nil {
-		log.Fatal(openDbErr)
-	}
-	defer db.Close()
-	// Create the single hearthstone table
-	createTableStatement := `
-	create table if not exists hearthstone(
-		id integer not null primary key,
-		time datetime default current_timestamp,
-		type integer not null,
-		size integer not null,
-		payload blob);
-	`
-	_, createTableErr := db.Exec(createTableStatement)
-	if createTableErr != nil {
-		log.Printf("%q: %s\n", createTableErr, createTableStatement)
-		return
-	}
 
-	// Create an index on the type column
-	createTypeIndexStatement := `
-	create index if not exists typeindex on hearthstone (type)
-	`
-	_, createIndexErr := db.Exec(createTypeIndexStatement)
-	if createIndexErr != nil {
-		log.Printf("%q: %s\n", createIndexErr, createTypeIndexStatement)
-		return
-	}
-
-	// Log any pegasus packets into the database
-	pegasusPackets := make(chan PegasusPacket)
-	go func() {
-		for packet := range pegasusPackets {
-			tx, err := db.Begin()
-			if err != nil {
-				log.Fatal(err)
-			}
-			insertStatement, err := tx.Prepare("insert into hearthstone(type, size, payload) values(?, ?, ?)")
-			if err != nil {
-				log.Fatal(err)
-			}
-			defer insertStatement.Close()
-			_, err = insertStatement.Exec(packet.Type, packet.Size, packet.Payload)
-			if err != nil {
-				log.Fatal(err)
-			}
-			tx.Commit()
-		}
-	}()
-
-	// Capture packets
-	streamFactory := &PegasusPacketStreamFactory{Out: pegasusPackets}
-	streamPool := tcpassembly.NewStreamPool(streamFactory)
-	assembler := tcpassembly.NewAssembler(streamPool)
-
+	// Listen on all devices so the user doesn't have to figure out which device to select
 	devices, _ := pcap.FindAllDevs()
 	capturedPackets := capturePackets(devices, *snaplen, *filter)
-	ticker := time.Tick(time.Minute)
+
+	// Feed captured packets into the tcp stream assembler
+	streamFactory := &PegasusPacketStreamFactory{}
+	streamPool := tcpassembly.NewStreamPool(streamFactory)
+	assembler := tcpassembly.NewAssembler(streamPool)
+	streamFlushTicker := time.Tick(time.Minute)
 	for {
 		select {
 		case packet := <-capturedPackets:
@@ -198,7 +143,7 @@ func main() {
 				tcp, _ := tcpLayer.(*layers.TCP)
 				assembler.AssembleWithTimestamp(packet.NetworkLayer().NetworkFlow(), tcp, packet.Metadata().Timestamp)
 			}
-		case <-ticker:
+		case <-streamFlushTicker:
 			assembler.FlushOlderThan(time.Now().Add(-time.Minute))
 		}
 	}
